@@ -15,6 +15,13 @@ from sqlalchemy import func, select, update as sql_update
 from config import get_config
 from database import get_session
 from models import Message
+from errors import (
+    log_error,
+    log_warning,
+    log_info,
+    ErrorCategory,
+)
+from userbot import get_muted_chats, get_large_group_ids
 
 logger = logging.getLogger(__name__)
 
@@ -25,29 +32,88 @@ _scheduler: Optional[AsyncIOScheduler] = None
 async def get_unlabeled_messages(hours: int, limit: int) -> list[Message]:
     """
     Get unlabeled messages from the last N hours, sorted by priority score.
-    
+
     Args:
         hours: Number of hours to look back
         limit: Maximum number of messages to return
-    
+
     Returns:
         List of Message objects sorted by priority_score DESC
     """
     config = get_config()
     cutoff_time = datetime.utcnow() - timedelta(hours=hours)
-    
+
+    # Get user's min priority score preference (fallback to env var)
+    from models import UserPreferences
+
+    min_priority = config.scheduler.min_priority_score  # Default from env
+
+    # Get filtering configuration
+    ignore_muted = config.filter.ignore_muted_chats
+    ignore_large_groups = config.filter.ignore_large_groups
+    max_group_size = config.filter.max_group_size
+
+    # Build list of excluded chat IDs
+    excluded_chat_ids = set()
+    muted_count = 0
+    large_groups_count = 0
+
+    if ignore_muted:
+        muted_chats = get_muted_chats()
+        excluded_chat_ids.update(muted_chats)
+        muted_count = len(muted_chats)
+    if ignore_large_groups:
+        large_groups = get_large_group_ids(max_group_size)
+        excluded_chat_ids.update(large_groups)
+        large_groups_count = len(large_groups)
+
+    # Load user preferences for min priority score
     async with get_session() as session:
-        result = await session.execute(
-            select(Message)
-            .where(
-                Message.timestamp >= cutoff_time,
-                Message.label.is_(None),
-                Message.included_in_summary == False,
-                Message.priority_score >= config.scheduler.min_priority_score,
+        try:
+            result_prefs = await session.execute(
+                select(UserPreferences)
+                .where(UserPreferences.user_id == config.telegram.client_user_id)
             )
-            .order_by(Message.priority_score.desc(), Message.timestamp.desc())
-            .limit(limit)
+            user_prefs = result_prefs.scalar_one_or_none()
+
+            # Get user's min priority preference
+            if user_prefs and user_prefs.min_priority_score is not None:
+                min_priority = user_prefs.min_priority_score
+
+        except Exception:
+            pass  # Use defaults
+
+    if excluded_chat_ids:
+        log_info(
+            ErrorCategory.FILTERING,
+            f"Excluding {len(excluded_chat_ids)} chats from summary",
+            context={
+                "muted_count": muted_count,
+                "large_groups_count": large_groups_count,
+                "total_excluded": len(excluded_chat_ids)
+            }
         )
+
+    async with get_session() as session:
+
+        # Build query with filtering
+        query = select(Message).where(
+            Message.timestamp >= cutoff_time,
+            Message.label.is_(None),
+            Message.included_in_summary == False,
+            Message.priority_score >= min_priority,
+        )
+
+        # Exclude muted chats and large groups if enabled
+        if excluded_chat_ids:
+            query = query.where(Message.chat_id.notin_(excluded_chat_ids))
+
+        query = query.order_by(
+            Message.priority_score.desc(),
+            Message.timestamp.desc()
+        ).limit(limit)
+
+        result = await session.execute(query)
         messages = result.scalars().all()
         
         # Mark these messages as included in summary
@@ -103,33 +169,45 @@ async def generate_and_send_summary() -> None:
     config = get_config()
     hours = config.scheduler.summary_interval_hours
     max_messages = config.scheduler.max_messages_per_summary
-    
-    logger.info(f"Generating summary for last {hours} hours...")
-    
+
+    log_info(
+        ErrorCategory.SCHEDULING,
+        "Starting summary generation",
+        context={"hours": hours, "max_messages": max_messages}
+    )
+
     try:
         # Get statistics
         total_messages, unique_chats = await get_message_stats(hours)
-        
+
         if total_messages == 0:
-            logger.info("No messages in time range, skipping summary")
+            log_info(
+                ErrorCategory.SCHEDULING,
+                "No messages in time range, sending empty summary",
+                context={"hours": hours}
+            )
             await send_simple_message(
                 f"📊 *Summary of last {hours} hours*\n\n"
                 "No new messages received. Enjoy the quiet! 🧘"
             )
             return
-        
+
         # Get top messages
         messages = await get_unlabeled_messages(hours, max_messages)
-        
+
         if not messages:
-            logger.info("No unlabeled messages to summarize")
+            log_info(
+                ErrorCategory.SCHEDULING,
+                "No unlabeled messages to summarize",
+                context={"total_messages": total_messages, "hours": hours}
+            )
             await send_simple_message(
                 f"📊 *Summary of last {hours} hours*\n\n"
                 f"You received *{total_messages}* messages, "
                 "but none need your attention right now. ✅"
             )
             return
-        
+
         # Send summary
         await send_summary(
             messages=messages,
@@ -137,13 +215,26 @@ async def generate_and_send_summary() -> None:
             total_chats=unique_chats,
             time_range_hours=hours,
         )
-        
-        logger.info(
-            f"Summary sent: {len(messages)} messages from {total_messages} total"
+
+        log_info(
+            ErrorCategory.SCHEDULING,
+            "Summary sent successfully",
+            context={
+                "messages_in_summary": len(messages),
+                "total_messages": total_messages,
+                "unique_chats": unique_chats,
+                "hours": hours
+            }
         )
-        
+
     except Exception as e:
-        logger.error(f"Error generating summary: {e}", exc_info=True)
+        log_error(
+            ErrorCategory.SCHEDULING,
+            "Failed to generate and send summary",
+            error=e,
+            context={"hours": hours},
+            include_trace=True
+        )
         try:
             await send_simple_message(
                 f"❌ Error generating summary: {str(e)}\n\n"
@@ -169,9 +260,9 @@ async def scheduled_summary_job() -> None:
     Scheduled job wrapper that checks conditions before generating summary.
     """
     if is_quiet_hours():
-        logger.info("Quiet hours active, skipping summary")
+        log_info(ErrorCategory.SCHEDULING, "Quiet hours active, skipping summary")
         return
-    
+
     await generate_and_send_summary()
 
 
@@ -204,37 +295,65 @@ async def start_scheduler() -> AsyncIOScheduler:
         # Run first summary after startup delay
         next_run_time=datetime.now(timezone) + timedelta(minutes=5),
     )
-    
+
+    # Add muted chats cache refresh job (every 15 minutes)
+    # This ensures the muted chats list stays up-to-date
+    from userbot import refresh_muted_chats, refresh_group_sizes
+    _scheduler.add_job(
+        refresh_muted_chats,
+        trigger=IntervalTrigger(minutes=15),
+        id="refresh_muted_chats_job",
+        name="Refresh muted chats cache",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone) + timedelta(seconds=30),  # First run after 30 seconds
+    )
+
+    # Add group sizes cache refresh job (every 30 minutes)
+    # Group sizes change less frequently than mute status
+    _scheduler.add_job(
+        refresh_group_sizes,
+        trigger=IntervalTrigger(minutes=30),
+        id="refresh_group_sizes_job",
+        name="Refresh group sizes cache",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone) + timedelta(seconds=45),  # First run after 45 seconds
+    )
+
     # Start the scheduler
     _scheduler.start()
-    
-    logger.info(
-        f"Scheduler started. Summary job runs every "
-        f"{config.scheduler.summary_interval_hours} hours. "
-        f"First run in 5 minutes."
+
+    log_info(
+        ErrorCategory.SCHEDULING,
+        "Scheduler started successfully",
+        context={
+            "interval_hours": config.scheduler.summary_interval_hours,
+            "first_summary": "5 minutes",
+            "first_cache_refresh": "30-45 seconds",
+            "timezone": config.scheduler.timezone
+        }
     )
-    
+
     return _scheduler
 
 
 async def stop_scheduler() -> None:
     """Stop the scheduler gracefully."""
     global _scheduler
-    
+
     if _scheduler:
-        logger.info("Stopping scheduler...")
+        log_info(ErrorCategory.SCHEDULING, "Stopping scheduler")
         _scheduler.shutdown(wait=True)
         _scheduler = None
-        logger.info("Scheduler stopped")
+        log_info(ErrorCategory.SCHEDULING, "Scheduler stopped successfully")
 
 
 async def trigger_summary_now() -> None:
     """
     Manually trigger a summary immediately.
-    
+
     Useful for testing or on-demand summaries.
     """
-    logger.info("Manual summary triggered")
+    log_info(ErrorCategory.SCHEDULING, "Manual summary triggered by user")
     await generate_and_send_summary()
 
 

@@ -92,21 +92,37 @@ class UserPreferences(Base):
     Currently designed for single user but extensible for multi-user.
     """
     __tablename__ = "user_preferences"
-    
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    
+
+    # User profile/context for AI personalization
+    user_context: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Description of what user uses Telegram for (work, personal, etc.)"
+    )
+
     # Summary preferences
     summary_interval_hours: Mapped[int] = mapped_column(Integer, default=4)
     max_messages_per_summary: Mapped[int] = mapped_column(Integer, default=15)
-    
+    min_priority_score: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Warning preferences
+    warning_threshold_score: Mapped[int] = mapped_column(Integer, default=8)
+
+    # Filtering preferences
+    ignore_large_groups: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_group_size: Mapped[int] = mapped_column(Integer, default=20)
+    ignore_muted_chats: Mapped[bool] = mapped_column(Boolean, default=True)
+
     # Filtering preferences (stored as JSON string for SQLite compatibility)
     excluded_chat_ids_json: Mapped[Optional[str]] = mapped_column(
-        Text, 
+        Text,
         default="[]",
         nullable=True
     )
-    
+
     # Quiet hours (don't send summaries during this time)
     quiet_hours_start: Mapped[Optional[datetime]] = mapped_column(Time, nullable=True)
     quiet_hours_end: Mapped[Optional[datetime]] = mapped_column(Time, nullable=True)
